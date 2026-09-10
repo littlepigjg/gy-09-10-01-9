@@ -22,8 +22,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import APP_HOST, APP_PORT
 from database import init_db, async_session, engine
-from models import RateLimitRule, CircuitBreakerState, RateLimitEvent, TrafficStat
+from models import RateLimitRule, CircuitBreakerState, RateLimitEvent, TrafficStat, WindowTuneResult
 from rate_limiter import RateLimitManager
+from rate_limiter import window_tuner
 from circuit_breaker import CircuitBreakerManager
 
 # 日志配置
@@ -60,6 +61,7 @@ async def persist_events():
             async with async_session() as session:
                 for ev in events_to_write:
                     session.add(RateLimitEvent(
+                        rule_id=ev.get("rule_id"),
                         path=ev["path"],
                         client_ip=ev["client_ip"],
                         algorithm=ev["algorithm"],
@@ -121,6 +123,7 @@ async def persist_circuit_breaker_states():
 def on_rate_limit_event(path, client_ip, rule, result):
     """限流事件回调（限流检查可能在线程池中执行，使用线程安全方式缓冲）"""
     event = {
+        "rule_id": rule.get("id"),
         "path": path,
         "client_ip": client_ip,
         "algorithm": rule.get("algorithm", "unknown"),
@@ -130,7 +133,9 @@ def on_rate_limit_event(path, client_ip, rule, result):
         "reason": result.reason,
     }
     with event_buffer_lock:
-        event_buffer.append(event)
+        # 缓冲上限保护，防止事件洪峰撑爆内存
+        if len(event_buffer) < 50000:
+            event_buffer.append(event)
 
 
 def on_circuit_breaker_change(service_name, old_state, new_state):
@@ -369,6 +374,7 @@ async def create_rule(request: Request):
             rate=data["rate"],
             burst=data.get("burst", int(data["rate"])),
             window_size=data.get("window_size", 60),
+            slot_granularity=data.get("slot_granularity", 1.0),
             enabled=data.get("enabled", True),
         )
         session.add(rule)
@@ -392,7 +398,7 @@ async def update_rule(rule_id: int, request: Request):
         if not rule:
             raise HTTPException(404, "规则不存在")
 
-        for field in ["path", "method", "algorithm", "rate", "burst", "window_size", "enabled"]:
+        for field in ["path", "method", "algorithm", "rate", "burst", "window_size", "slot_granularity", "enabled"]:
             if field in data:
                 setattr(rule, field, data[field])
 
@@ -417,6 +423,90 @@ async def delete_rule(rule_id: int):
         rate_limit_manager.remove_rule(path)
 
     return {"message": "规则删除成功"}
+
+
+# ==================== 滑动窗口自适应重估API ====================
+
+@app.post("/api/window-tuner/run")
+async def run_window_tuner():
+    """对所有 sliding_window 规则执行一次参数重估（20s 内完成）"""
+    try:
+        async with async_session() as session:
+            results = await asyncio.wait_for(
+                window_tuner.run_full_evaluation(session, rate_limit_manager),
+                timeout=window_tuner.EVAL_BUDGET_SECONDS + 1.0,
+            )
+        return {"message": "重估完成", "count": len(results), "results": results}
+    except asyncio.TimeoutError:
+        raise HTTPException(504, "重估超时，已返回部分结果")
+
+
+@app.get("/api/window-tuner/results")
+async def list_window_tune_results():
+    """获取每条规则最近一次重估结果（含现槽宽与建议槽宽偏差）"""
+    async with async_session() as session:
+        result = await session.execute(
+            select(WindowTuneResult)
+            .order_by(WindowTuneResult.evaluated_at.desc(), WindowTuneResult.id.desc())
+            .limit(500)
+        )
+        rows = result.scalars().all()
+
+    # 每条规则仅保留最近一次评估
+    latest: dict[int, dict] = {}
+    for r in rows:
+        if r.rule_id in latest:
+            continue
+        latest[r.rule_id] = {
+            "rule_id": r.rule_id,
+            "path": r.path,
+            "window_size": r.window_size,
+            "current_slot_granularity": r.current_slot_granularity,
+            "suggested_window_size": r.suggested_window_size,
+            "suggested_slot_granularity": r.suggested_slot_granularity,
+            "suggested_slot_count": r.suggested_slot_count,
+            "sample_count": r.sample_count,
+            "confidence": r.confidence,
+            "status": r.status,
+            "deviation_pct": r.deviation_pct,
+            "detail": r.detail,
+            "evaluated_at": r.evaluated_at.isoformat() if r.evaluated_at else None,
+        }
+    return list(latest.values())
+
+
+@app.post("/api/window-tuner/apply/{rule_id}")
+async def apply_window_tune(rule_id: int):
+    """把最近一次重估建议应用到规则（热更新，已计数请求不清零）"""
+    async with async_session() as session:
+        result = await session.execute(
+            select(WindowTuneResult)
+            .where(WindowTuneResult.rule_id == rule_id)
+            .order_by(WindowTuneResult.evaluated_at.desc(), WindowTuneResult.id.desc())
+            .limit(1)
+        )
+        tune = result.scalar_one_or_none()
+        if not tune:
+            raise HTTPException(404, "该规则暂无重估结果")
+
+        result = await session.execute(
+            select(RateLimitRule).where(RateLimitRule.id == rule_id))
+        rule = result.scalar_one_or_none()
+        if not rule:
+            raise HTTPException(404, "规则不存在")
+
+        rule.window_size = tune.suggested_window_size
+        rule.slot_granularity = tune.suggested_slot_granularity
+        await session.commit()
+        # 增量热更新：滑动窗口走 retune 路径，窗口内计数保留
+        await rate_limit_manager.load_rules(session)
+
+    return {
+        "message": "已应用重估建议",
+        "rule_id": rule_id,
+        "window_size": tune.suggested_window_size,
+        "slot_granularity": tune.suggested_slot_granularity,
+    }
 
 
 # ==================== 熔断器API ====================

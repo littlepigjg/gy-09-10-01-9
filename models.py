@@ -1,6 +1,6 @@
 """数据库模型"""
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, Float, DateTime, Text, Boolean, JSON
+from sqlalchemy import Column, Integer, String, Float, DateTime, Text, Boolean, JSON, Index
 from database import Base
 
 
@@ -15,6 +15,7 @@ class RateLimitRule(Base):
     rate = Column(Float, nullable=False, comment="速率(每秒请求数)")
     burst = Column(Integer, default=0, comment="突发容量")
     window_size = Column(Integer, default=60, comment="窗口大小(秒)")
+    slot_granularity = Column(Float, default=1.0, comment="槽粒度(秒，仅滑动窗口)")
     enabled = Column(Boolean, default=True, comment="是否启用")
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
@@ -47,6 +48,7 @@ class RateLimitEvent(Base):
     __tablename__ = "rate_limit_events"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    rule_id = Column(Integer, nullable=True, index=True, comment="关联规则ID")
     path = Column(String(255), nullable=False)
     client_ip = Column(String(50))
     algorithm = Column(String(50))
@@ -54,7 +56,31 @@ class RateLimitEvent(Base):
     current_rate = Column(Float, comment="当前速率")
     limit_rate = Column(Float, comment="限制速率")
     reason = Column(String(200), comment="拒绝原因")
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime(6), default=datetime.now, comment="事件时间(微秒级)")
+
+
+class WindowTuneResult(Base):
+    """滑动窗口参数重估结果"""
+    __tablename__ = "window_tune_results"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    rule_id = Column(Integer, nullable=False, comment="规则ID")
+    path = Column(String(255), nullable=False, comment="规则路径")
+    window_size = Column(Integer, comment="评估时窗口大小(秒)")
+    current_slot_granularity = Column(Float, comment="现槽宽(秒)")
+    suggested_window_size = Column(Integer, comment="建议窗口大小(秒)")
+    suggested_slot_granularity = Column(Float, comment="建议槽宽(秒)")
+    suggested_slot_count = Column(Integer, comment="建议槽数")
+    sample_count = Column(Integer, default=0, comment="样本数(到达间隔数)")
+    confidence = Column(Float, default=0, comment="置信度 0~1")
+    status = Column(String(20), default="ok", comment="评估状态: ok/empty/burst")
+    deviation_pct = Column(Float, default=0, comment="现槽宽与建议槽宽偏差(%)")
+    detail = Column(String(500), default="", comment="评估说明")
+    evaluated_at = Column(DateTime, default=datetime.now, comment="评估时间")
+
+    __table_args__ = (
+        Index("idx_rule_evaluated", "rule_id", "evaluated_at"),
+    )
 
 
 class TrafficStat(Base):

@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS rate_limit_rules (
     rate FLOAT NOT NULL,
     burst INT DEFAULT 0,
     window_size INT DEFAULT 60,
+    slot_granularity FLOAT DEFAULT 1.0,
     enabled BOOLEAN DEFAULT TRUE,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -40,6 +41,7 @@ CREATE TABLE IF NOT EXISTS circuit_breaker_states (
 -- 限流事件日志
 CREATE TABLE IF NOT EXISTS rate_limit_events (
     id INT AUTO_INCREMENT PRIMARY KEY,
+    rule_id INT NULL,
     path VARCHAR(255) NOT NULL,
     client_ip VARCHAR(50),
     algorithm VARCHAR(50),
@@ -47,8 +49,28 @@ CREATE TABLE IF NOT EXISTS rate_limit_events (
     current_rate FLOAT,
     limit_rate FLOAT,
     reason VARCHAR(200),
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_created (created_at)
+    created_at DATETIME(6) DEFAULT CURRENT_TIMESTAMP(6),
+    INDEX idx_created (created_at),
+    INDEX idx_rule_id (rule_id)
+) ENGINE=InnoDB;
+
+-- 滑动窗口参数重估结果表
+CREATE TABLE IF NOT EXISTS window_tune_results (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    rule_id INT NOT NULL,
+    path VARCHAR(255) NOT NULL,
+    window_size INT,
+    current_slot_granularity FLOAT,
+    suggested_window_size INT,
+    suggested_slot_granularity FLOAT,
+    suggested_slot_count INT,
+    sample_count INT DEFAULT 0,
+    confidence FLOAT DEFAULT 0,
+    status VARCHAR(20) DEFAULT 'ok',
+    deviation_pct FLOAT DEFAULT 0,
+    detail VARCHAR(500) DEFAULT '',
+    evaluated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_rule_evaluated (rule_id, evaluated_at)
 ) ENGINE=InnoDB;
 
 -- 流量统计表

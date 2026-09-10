@@ -41,22 +41,25 @@ class RateLimitManager:
         self._event_callback = callback
 
     async def load_rules(self, session: AsyncSession):
-        """从数据库加载限流规则"""
+        """从数据库加载限流规则（增量热更新）。
+
+        与 PUT /api/rules/{id} 并发安全：
+        - 滑动窗口规则参数变化时调用 limiter.retune() 原地重调，
+          窗口内已计数请求不清零、不重复扣减；
+        - 参数未变的规则复用原限流器实例，避免状态丢失；
+        - 仅算法变更或新增规则才创建新实例。
+        """
         result = await session.execute(select(RateLimitRule).where(RateLimitRule.enabled == True))
         rules = result.scalars().all()
 
         with self._lock:
-            self._rules.clear()
-            self._limiters.clear()
+            old_rules = self._rules
+            old_limiters = self._limiters
+            new_rules: dict[str, dict] = {}
+            new_limiters: dict[str, object] = {}
 
             for rule in rules:
-                algo_cls = ALGORITHM_MAP.get(rule.algorithm, TokenBucketLimiter)
-                limiter = algo_cls(
-                    rate=rule.rate,
-                    burst=rule.burst,
-                    window_size=rule.window_size,
-                )
-                self._rules[rule.path] = {
+                cfg = {
                     "id": rule.id,
                     "path": rule.path,
                     "method": rule.method,
@@ -64,8 +67,36 @@ class RateLimitManager:
                     "rate": rule.rate,
                     "burst": rule.burst,
                     "window_size": rule.window_size,
+                    "slot_granularity": getattr(rule, "slot_granularity", None) or 1.0,
                 }
-                self._limiters[rule.path] = limiter
+                new_rules[rule.path] = cfg
+
+                existing = old_limiters.get(rule.path)
+                old_cfg = old_rules.get(rule.path)
+                if existing is not None and old_cfg is not None \
+                        and old_cfg["algorithm"] == rule.algorithm:
+                    if isinstance(existing, SlidingWindowLimiter):
+                        # 原地热调：保留窗口内已计数请求
+                        existing.retune(rate=rule.rate,
+                                        window_size=rule.window_size,
+                                        slot_granularity=cfg["slot_granularity"])
+                        new_limiters[rule.path] = existing
+                        continue
+                    if old_cfg["rate"] == rule.rate and old_cfg["burst"] == rule.burst \
+                            and old_cfg["window_size"] == rule.window_size:
+                        new_limiters[rule.path] = existing  # 参数未变，复用实例
+                        continue
+
+                algo_cls = ALGORITHM_MAP.get(rule.algorithm, TokenBucketLimiter)
+                new_limiters[rule.path] = algo_cls(
+                    rate=rule.rate,
+                    burst=rule.burst,
+                    window_size=rule.window_size,
+                    slot_granularity=cfg["slot_granularity"],
+                )
+
+            self._rules = new_rules
+            self._limiters = new_limiters
 
         logger.info(f"已加载 {len(rules)} 条限流规则")
 
@@ -112,8 +143,9 @@ class RateLimitManager:
             else:
                 self._stats["rejected_requests"] += 1
 
-        # 异步事件回调（非阻塞）
-        if self._event_callback and not result.allowed:
+        # 异步事件回调（非阻塞）。记录全部命中规则的请求（含通过），
+        # 供窗口参数自适应重估依据到达间隔分布反推槽宽/槽数。
+        if self._event_callback:
             try:
                 self._event_callback(path, client_ip, self._rules.get(pattern, {}), result)
             except Exception as e:
