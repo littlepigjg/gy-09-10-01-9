@@ -120,6 +120,17 @@ async def persist_circuit_breaker_states():
             logger.error(f"持久化熔断器状态失败: {e}")
 
 
+async def cleanup_window_tune_results():
+    """定时清理重估结果表：每个 rule_id 仅保留最近 50 条，防止无限膨胀"""
+    while True:
+        await asyncio.sleep(600)  # 每10分钟清理一次
+        try:
+            async with async_session() as session:
+                await window_tuner.cleanup_old_results(session)
+        except Exception as e:
+            logger.error(f"清理重估结果失败: {e}")
+
+
 def on_rate_limit_event(path, client_ip, rule, result):
     """限流事件回调（限流检查可能在线程池中执行，使用线程安全方式缓冲）"""
     event = {
@@ -167,6 +178,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(persist_events()),
         asyncio.create_task(persist_traffic_stats()),
         asyncio.create_task(persist_circuit_breaker_states()),
+        asyncio.create_task(cleanup_window_tune_results()),
     ]
 
     logger.info(f"限流熔断网关启动: http://{APP_HOST}:{APP_PORT}")

@@ -38,6 +38,9 @@ EVAL_BUDGET_SECONDS = 19.0      # 全规则重估时间预算(20s 上限内)
 SAMPLE_CONFIDENCE_FULL = 200    # 样本数达到该值时样本充足度为 1
 BURST_CONFIDENCE = 0.2          # 突发单点场景的固定低置信度
 
+# 结果表清理：每个 rule_id 保留的最近评估记录数
+KEEP_RESULTS_PER_RULE = 50
+
 
 def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
@@ -150,7 +153,7 @@ async def run_full_evaluation(session, manager) -> list[dict]:
     单次全规则重估在 20s 内完成。与 PUT /api/rules/{id} 热更新并发：
     规则快照在入口取一次，事件流为只读查询，互不加锁。
     """
-    from sqlalchemy import select
+    from sqlalchemy import select, func
     from models import RateLimitEvent, WindowTuneResult
 
     started = time.monotonic()
@@ -159,12 +162,21 @@ async def run_full_evaluation(session, manager) -> list[dict]:
         return []
 
     since = datetime.now() - timedelta(seconds=EVENT_LOOKBACK_SECONDS)
+    time_filter = RateLimitEvent.created_at >= since
+
+    # 先数窗口内事件总量，再用 ASC 正序 + OFFSET 直接取最后 N 条，
+    # 避免 DESC LIMIT 后在内存 reverse，且 ASC 走主键顺序扫描
+    total = (await session.execute(
+        select(func.count()).select_from(RateLimitEvent).where(time_filter)
+    )).scalar() or 0
+    offset = max(0, total - MAX_EVENTS_PER_RUN)
+
     stmt = (select(RateLimitEvent)
-            .where(RateLimitEvent.created_at >= since)
-            .order_by(RateLimitEvent.id.desc())
+            .where(time_filter)
+            .order_by(RateLimitEvent.id.asc())
+            .offset(offset)
             .limit(MAX_EVENTS_PER_RUN))
-    rows = (await session.execute(stmt)).scalars().all()
-    events = list(reversed(rows))  # 恢复时间正序
+    events = list((await session.execute(stmt)).scalars().all())  # 已按时间正序
 
     groups = group_events_by_rule(events, rules)
     evaluated_at = datetime.now()
@@ -220,3 +232,35 @@ async def run_full_evaluation(session, manager) -> list[dict]:
     elapsed = time.monotonic() - started
     logger.info(f"窗口参数重估完成: {len(results)}/{len(rules)} 条规则, 耗时 {elapsed:.2f}s")
     return results
+
+
+async def cleanup_old_results(session) -> int:
+    """清理重估结果表：每个 rule_id 仅保留最近 KEEP_RESULTS_PER_RULE 条。
+
+    用 ROW_NUMBER 按 (evaluated_at DESC, id DESC) 排名，删除排名超出
+    保留数的记录；派生表包一层以绕过 MySQL 不允许 DELETE 直接引用
+    目标表子查询的限制。返回删除的行数。
+    """
+    from sqlalchemy import text
+
+    result = await session.execute(text(
+        """
+        DELETE FROM window_tune_results
+        WHERE id NOT IN (
+            SELECT id FROM (
+                SELECT id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY rule_id
+                           ORDER BY evaluated_at DESC, id DESC
+                       ) AS rn
+                FROM window_tune_results
+            ) ranked
+            WHERE rn <= :keep
+        )
+        """
+    ), {"keep": KEEP_RESULTS_PER_RULE})
+    await session.commit()
+    deleted = result.rowcount or 0
+    if deleted:
+        logger.info(f"重估结果清理完成: 删除 {deleted} 条历史记录")
+    return deleted
